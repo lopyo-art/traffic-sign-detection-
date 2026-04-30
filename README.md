@@ -18,10 +18,6 @@ custom-trained **YOLOv8l** model.
                                                              labels, analytics)
 ```
 
-The Pi acts as a "dumb camera" - it does not load a model and does not draw
-anything. The PC pulls raw frames, runs YOLOv8l, and shows the annotated feed
-in a Streamlit dashboard.
-
 ---
 
 ## Project layout
