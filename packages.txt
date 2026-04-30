@@ -1,5 +1,0 @@
-# No system packages required.
-# - opencv-python-headless does not need libGL / libglib.
-# - av (PyAV) ships ffmpeg inside its manylinux wheel.
-# Requesting libglib2.0-0 / ffmpeg on the current Debian 13 base image
-# triggers a t64 transition conflict that kills the whole apt step.
