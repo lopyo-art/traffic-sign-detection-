@@ -1,0 +1,14 @@
+# ============================================================
+# RoadGuard - Raspberry Pi 4 streamer requirements
+# ============================================================
+# The Pi only captures frames and serves them over HTTP.
+# It does NOT run YOLO inference.
+#
+# Install on the Pi:
+#   sudo apt update
+#   sudo apt install -y python3-opencv      # preferred (uses APT package)
+#   pip3 install -r requirements_rpi.txt    # OR install via pip
+# ============================================================
+
+flask>=2.3
+opencv-python>=4.5     # if APT's python3-opencv is unavailable

@@ -1,0 +1,21 @@
+# ============================================================
+# RoadGuard - PC dashboard requirements
+# ============================================================
+# Install on the host PC running the Streamlit dashboard:
+#   pip install -r requirements_pc.txt
+#
+# For GPU acceleration (NVIDIA), install the matching torch /
+# torchvision wheels for your CUDA version BEFORE this file:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# ============================================================
+
+streamlit>=1.32
+ultralytics>=8.1.0
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+Pillow>=10.0
+
+# Pinning torch is intentionally avoided: let the user install the
+# variant (CPU vs CUDA) that matches their hardware. ultralytics will
+# pull a torch wheel automatically if none is installed.
