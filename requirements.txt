@@ -1,21 +1,30 @@
-# ============================================================
-# RoadGuard - PC dashboard requirements
-# ============================================================
-# Install on the host PC running the Streamlit dashboard:
-#   pip install -r requirements_pc.txt
-#
-# For GPU acceleration (NVIDIA), install the matching torch /
-# torchvision wheels for your CUDA version BEFORE this file:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# ============================================================
+# RoadGuard - dependencies for Streamlit Cloud / GitHub deployment
+# ----------------------------------------------------------------
+# This is the file Streamlit Cloud auto-detects on a fresh build.
+# Keep it in sync with requirements_pc.txt for local installs.
 
 streamlit>=1.32
 ultralytics>=8.1.0
+
+# Use the *headless* OpenCV on Streamlit Cloud - the cloud runner has
+# no display server, so plain opencv-python will fail at import time
+# (libGL.so.1 missing). Headless is identical in API.
 opencv-python-headless>=4.8
+
 numpy>=1.24
 pandas>=2.0
 Pillow>=10.0
 
-# Pinning torch is intentionally avoided: let the user install the
-# variant (CPU vs CUDA) that matches their hardware. ultralytics will
-# pull a torch wheel automatically if none is installed.
+# Continuous Live (WebRTC) mode
+streamlit-webrtc>=0.47
+av>=10.0
+aiortc>=1.6
+
+# Vocal alerts (the toggle stays greyed out if gtts is missing)
+gtts>=2.4
+
+# torch / torchvision will be pulled in by ultralytics if not pinned.
+# Pin a CPU build here so Streamlit Cloud doesn't try to fetch a CUDA
+# wheel it can't run on.
+torch>=2.1
+torchvision>=0.16
