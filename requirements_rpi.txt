@@ -1,14 +1,30 @@
 # ============================================================
-# RoadGuard - Raspberry Pi 4 streamer requirements
+# RoadGuard - Raspberry Pi 4 streamer + audio announcer requirements
 # ============================================================
-# The Pi only captures frames and serves them over HTTP.
-# It does NOT run YOLO inference.
+# The Pi captures frames, serves them over HTTP MJPEG, and plays
+# spoken announcements through a connected speaker when the PC POSTs
+# detected class names to /announce.
+#
+# It does NOT run YOLO inference. There is no torch / ultralytics here.
 #
 # Install on the Pi:
 #   sudo apt update
-#   sudo apt install -y python3-opencv      # preferred (uses APT package)
-#   pip3 install -r requirements_rpi.txt    # OR install via pip
+#   sudo apt install -y python3-opencv python3-flask
+#
+#   # Audio output - install AT LEAST ONE of these two paths.
+#   # (a) Best voice quality (requires internet on the Pi to generate
+#   #     the MP3 the first time each class is announced; cached after):
+#   sudo apt install -y mpg123
+#   pip3 install gtts
+#
+#   # (b) Fully offline robotic voice (no internet needed):
+#   sudo apt install -y espeak-ng
+#
+#   pip3 install -r requirements_rpi.txt    # remaining python deps
 # ============================================================
 
 flask>=2.3
 opencv-python>=4.5     # if APT's python3-opencv is unavailable
+
+# Optional: pretty TTS via Google. Skip if you only want espeak-ng.
+gtts>=2.4

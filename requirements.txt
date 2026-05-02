@@ -23,6 +23,9 @@ aiortc>=1.6
 # Vocal alerts (the toggle stays greyed out if gtts is missing)
 gtts>=2.4
 
+# PC -> Pi /announce HTTP callback (Pi speaker feature)
+requests>=2.31
+
 # torch / torchvision will be pulled in by ultralytics if not pinned.
 # Pin a CPU build here so Streamlit Cloud doesn't try to fetch a CUDA
 # wheel it can't run on.

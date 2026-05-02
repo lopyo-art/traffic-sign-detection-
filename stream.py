@@ -1,13 +1,15 @@
 """
-RoadGuard - Raspberry Pi 4 MJPEG Streamer (camera-only, NO detection)
-=====================================================================
-Lightweight Flask server that captures frames from a USB / Pi-camera
-and broadcasts them as an MJPEG stream over Wi-Fi.
+RoadGuard - Raspberry Pi 4 MJPEG Streamer + Audio Announcer
+============================================================
+Lightweight Flask server that:
+    1. captures frames from a USB / Pi-camera and broadcasts them as
+       an MJPEG stream over Wi-Fi (camera-only, NO detection),
+    2. exposes POST /announce so the PC can ask the Pi to speak the
+       name of a detected sign through a speaker connected to the Pi.
 
-This script is intentionally a "dumb camera":
+This script is intentionally a "dumb camera + mouth":
     * NO YOLO
-    * NO bounding boxes
-    * NO labels
+    * NO bounding boxes / labels drawn here
     * NO model loading
     * NO ultralytics / torch dependency
 
@@ -17,32 +19,46 @@ All detection, drawing and analytics happen on the PC dashboard
     http://<RPI_IP>:5000/video_feed       <- raw MJPEG
     http://<RPI_IP>:5000/health           <- json status + capture FPS
     http://<RPI_IP>:5000/snapshot.jpg     <- single most-recent JPEG
+    http://<RPI_IP>:5000/announce         <- POST {"class": "Stop"} -> spoken
     http://<RPI_IP>:5000/                 <- preview page
 
 Designed for headless deployment on Raspberry Pi 4 (Bullseye / Bookworm).
 
 Install (on the Pi):
     sudo apt update
+    # core capture + serving
     sudo apt install -y python3-opencv python3-flask
+    # audio: pick at least one of these two paths
+    sudo apt install -y mpg123      # plays gTTS-generated MP3s (best voice)
+    sudo apt install -y espeak-ng   # offline robotic voice (no internet)
     # OR via pip:
     pip3 install -r requirements_rpi.txt
 
 Run:
     python3 stream.py --width 640 --height 480 --fps 20
+
+Test the announcer from anywhere on the LAN:
+    curl -X POST -H "Content-Type: application/json" \
+         -d '{"class": "Stop"}' http://<rpi-ip>:5000/announce
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
+import queue
+import re
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from collections import deque
 from typing import Optional
 
 import cv2
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -190,10 +206,171 @@ class Camera:
 
 
 # ---------------------------------------------------------------------------
+# Speaker - plays detection announcements through the Pi's audio output
+# ---------------------------------------------------------------------------
+class Speaker:
+    """Background TTS player.
+
+    The PC POSTs the detected class name to /announce on the Pi.
+    This class queues the request and plays it through the system
+    speaker without blocking the streaming thread.
+
+    Backend selection (in priority order, first available wins):
+      1. Cached MP3 + mpg123       -- best voice, requires gTTS once per
+                                      class to generate the MP3 (then
+                                      offline forever after caching).
+      2. espeak-ng / espeak        -- fully offline, robotic voice.
+
+    Cooldown: the same class will not be re-announced within
+    cooldown_s seconds. This prevents the speaker spamming "Stop, Stop,
+    Stop, ..." on every frame in which a stop sign is visible.
+    """
+
+    AUDIO_DIR = "/tmp/roadguard_tts"
+
+    def __init__(self, cooldown_s: float = 3.0, queue_size: int = 20):
+        os.makedirs(self.AUDIO_DIR, exist_ok=True)
+        self.cooldown_s = cooldown_s
+        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=queue_size)
+        self._last_played: dict = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+        # Detect available backends
+        self._has_mpg123 = shutil.which("mpg123") is not None or shutil.which("mpg321") is not None
+        self._has_espeak = (shutil.which("espeak-ng") is not None
+                            or shutil.which("espeak") is not None)
+        try:
+            from gtts import gTTS  # noqa: F401
+            self._has_gtts = True
+        except Exception:
+            self._has_gtts = False
+
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        log.info("Speaker backends: mpg123=%s, espeak=%s, gtts=%s",
+                 self._has_mpg123, self._has_espeak, self._has_gtts)
+
+    # -------- public ---------------------------------------------------
+    def announce(self, class_name: str,
+                 text: Optional[str] = None,
+                 lang: str = "en") -> dict:
+        """Queue a phrase for playback in the requested language.
+
+        - class_name: used ONLY as the cooldown key (so the same sign
+          isn't repeated even if the spoken text differs slightly).
+        - text:       the exact phrase to speak. If omitted, falls back
+                      to "Detected <class_name>" in English.
+        - lang:       gTTS / espeak language code (e.g. 'en', 'fr').
+
+        Returns a status dict like {"queued": True} or
+        {"queued": False, "reason": "cooldown", "wait_s": 1.4}.
+        """
+        cls = (class_name or "").strip()
+        if not cls:
+            return {"queued": False, "reason": "empty"}
+        spoken = (text or f"Detected {cls}").strip()
+        lang = (lang or "en").strip().lower() or "en"
+
+        now = time.time()
+        with self._lock:
+            last = self._last_played.get(cls, 0.0)
+            wait = self.cooldown_s - (now - last)
+            if wait > 0:
+                return {"queued": False, "reason": "cooldown",
+                        "wait_s": round(wait, 2)}
+            self._last_played[cls] = now
+        try:
+            self._queue.put_nowait((spoken, lang))
+            return {"queued": True, "text": spoken, "lang": lang}
+        except queue.Full:
+            return {"queued": False, "reason": "queue_full"}
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # -------- internal -------------------------------------------------
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                # Backwards compat: old format was a bare class string.
+                if isinstance(item, tuple):
+                    text, lang = item
+                else:
+                    text, lang = f"Detected {item}", "en"
+                self._play(text, lang)
+            except Exception as e:
+                log.warning("Announce playback failed: %s", e)
+
+    def _audio_path(self, text: str, lang: str) -> str:
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", text)[:80] or "x"
+        return os.path.join(self.AUDIO_DIR, f"{lang}_{safe}.mp3")
+
+    def _ensure_mp3(self, text: str, lang: str) -> Optional[str]:
+        """Make sure an MP3 exists for this (text, lang) pair (cached).
+
+        Uses gTTS with the requested language code so French phrases
+        are spoken with a French voice."""
+        path = self._audio_path(text, lang)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        if not self._has_gtts:
+            return None
+        try:
+            from gtts import gTTS
+            tts = gTTS(text=text, lang=lang)
+            tts.save(path)
+            return path
+        except Exception as e:
+            log.warning("gTTS failed for %r/%s: %s", text, lang, e)
+            return None
+
+    @staticmethod
+    def _espeak_voice(lang: str) -> str:
+        """Map our short lang codes to espeak voice names."""
+        mapping = {"en": "en", "fr": "fr", "ar": "ar", "es": "es"}
+        return mapping.get(lang, "en")
+
+    def _play(self, text: str, lang: str) -> None:
+        # Path 1: cached MP3 + mpg123/mpg321 (best voice quality)
+        if self._has_mpg123:
+            path = self._ensure_mp3(text, lang)
+            if path:
+                player = "mpg123" if shutil.which("mpg123") else "mpg321"
+                subprocess.run(
+                    [player, "-q", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                )
+                return
+        # Path 2: espeak-ng / espeak (offline, with -v <lang>)
+        if self._has_espeak:
+            espeak = "espeak-ng" if shutil.which("espeak-ng") else "espeak"
+            subprocess.run(
+                [espeak, "-s", "150", "-v", self._espeak_voice(lang), text],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return
+        log.warning(
+            "No TTS backend available. Install one of: "
+            "(a) 'sudo apt install mpg123' + 'pip install gtts', "
+            "or (b) 'sudo apt install espeak-ng'."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 camera: Optional[Camera] = None  # populated in main()
+speaker: Optional[Speaker] = None  # populated in main()
 
 INDEX_HTML = """
 <!doctype html>
@@ -330,6 +507,41 @@ def video_feed():
     )
 
 
+@app.route("/announce", methods=["POST"])
+def announce():
+    """Receive a detection from the PC and play it through the speaker.
+
+    Accepts JSON or form-encoded data with these fields:
+        class: required string -- used as the cooldown key
+        text:  optional string -- the EXACT phrase to speak. If omitted,
+               defaults to "Detected <class>".
+        lang:  optional string -- gTTS language code. 'en' (default) or
+               'fr' are the two we use; other ISO codes also work as
+               long as gTTS supports them.
+
+    Examples:
+        curl -X POST -H "Content-Type: application/json" \\
+             -d '{"class": "Stop", "text": "Detected stop sign", "lang": "en"}' \\
+             http://<pi>:5000/announce
+
+        curl -X POST -H "Content-Type: application/json" \\
+             -d '{"class": "Stop", "text": "Panneau detecte: stop", "lang": "fr"}' \\
+             http://<pi>:5000/announce
+    """
+    if speaker is None:
+        return jsonify(ok=False, error="speaker not initialised"), 503
+    data = request.get_json(silent=True) or {}
+    if not data and request.form:
+        data = request.form.to_dict()
+    cls = (data.get("class") or "").strip()
+    if not cls:
+        return jsonify(ok=False, error="missing 'class' field"), 400
+    text = data.get("text") or None
+    lang = (data.get("lang") or "en").strip().lower() or "en"
+    result = speaker.announce(cls, text=text, lang=lang)
+    return jsonify(ok=True, **result)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -361,11 +573,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", type=str, default="0.0.0.0",
                    help="Bind address (default 0.0.0.0 = all interfaces)")
     p.add_argument("--port", type=int, default=5000)
+    p.add_argument("--announce-cooldown", type=float, default=3.0,
+                   help="Minimum seconds between repeated announcements "
+                        "of the same class (default 3.0)")
     return p.parse_args()
 
 
 def main() -> None:
-    global camera
+    global camera, speaker
     args = parse_args()
 
     camera = Camera(
@@ -377,8 +592,12 @@ def main() -> None:
     )
     camera.start()
 
+    speaker = Speaker(cooldown_s=args.announce_cooldown)
+
     app.config["PORT"] = args.port
     log.info("Streaming raw frames at http://%s:%d/video_feed",
+             _get_lan_ip(), args.port)
+    log.info("Announce endpoint:    http://%s:%d/announce  (POST {\"class\":\"Stop\"})",
              _get_lan_ip(), args.port)
     log.info("This streamer does NOT run YOLO. The PC dashboard handles detection.")
 
@@ -388,6 +607,8 @@ def main() -> None:
         log.info("Shutting down (KeyboardInterrupt).")
     finally:
         camera.stop()
+        if speaker is not None:
+            speaker.stop()
 
 
 if __name__ == "__main__":

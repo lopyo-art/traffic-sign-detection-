@@ -1,0 +1,467 @@
+================================================================================
+                                  ROADGUARD
+              REAL-TIME MOROCCAN TRAFFIC SIGN DETECTION SYSTEM
+                A Two-Tier Raspberry Pi + PC Implementation
+                       Using YOLOv8 and Streamlit
+================================================================================
+
+
+COVER PAGE
+================================================================================
+
+Title:            RoadGuard - Real-time Moroccan Traffic Sign Detection
+                  using a Raspberry Pi camera node and a YOLOv8 inference
+                  dashboard on a host PC
+
+Authors:         Zakaria mouhibe
+
+Supervisor:       Yousra Chtouki
+
+Institution:      AUI Al Akhawayn university 
+
+Academic year:    2026
+
+
+
+--------------------------------------------------------------------------------
+ABSTRACT
+--------------------------------------------------------------------------------
+
+This report presents RoadGuard, a real-time traffic sign detection system
+designed for Moroccan road signage. The system follows a distributed,
+two-tier architecture: a Raspberry Pi 4 acts as a camera-only streaming
+node, while a host PC performs all deep-learning inference and renders
+an interactive dashboard.
+
+The Pi captures frames from an attached camera and broadcasts them as an
+MJPEG stream over Wi-Fi/LAN on port 5000. The PC pulls the stream, runs
+a YOLOv8 model trained on Moroccan traffic signs, draws bounding boxes
+and class labels on each frame, and displays the annotated video and
+detection analytics in a Streamlit dashboard, while you can run this streamlit on the internet using this link https://traffic-sign-detection-git-zakaria.streamlit.app/.
+
+This separation keeps the Pi lightweight (no model, no PyTorch, no
+Ultralytics) while leveraging the PC's compute resources. The dashboard
+provides three operating modes (single-shot capture, continuous local
+WebRTC, and remote Pi stream), a light/dark theme, per-class analytics,
+a confidence histogram, snapshot capture, optional vocal alerts and CSV
+export of detection history.
+
+--------------------------------------------------------------------------------
+ACKNOWLEDGEMENTS
+--------------------------------------------------------------------------------
+
+We thank our supervisor Yousra Chtouki for guidance throughout the project 
+
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+
+1.  Introduction
+2.  Related Work
+3.  System Architecture
+4.  Dataset and Training
+5.  Implementation
+6.  Results
+7.  Challenges Encountered
+8.  Future Work
+9.  Conclusion
+10. References
+11. Appendix
+
+
+================================================================================
+1. INTRODUCTION
+================================================================================
+
+
+
+--------------
+The project aims to:
+
+  - design a low-cost, two-device architecture in which a Raspberry Pi
+    captures live video and a host PC handles inference;
+  - train a YOLOv8 detector on a Moroccan traffic-sign dataset;
+  - deliver an end-user dashboard with bounding-box visualisation,
+    detection logging and analytics;
+  - keep the Pi node deliberately lightweight (no deep-learning stack)
+    so it can be deployed cheaply at the edge.
+
+1.3 Use case
+------------
+  - Driver-assistance prototype.
+
+
+
+================================================================================
+3. SYSTEM ARCHITECTURE
+================================================================================
+
+3.1 Overview
+------------
+
+  +------------------------+        Wi-Fi / LAN (MJPEG)        +-----------------------------+
+  |  Raspberry Pi 4        |  ============================>    |   Host PC                   |
+  |  stream.py (Flask)     |   http://<rpi-ip>:5000/video_feed |   app.py (Streamlit)        |
+  |  Pi / USB camera       |                                   |   YOLOv8 + best.pt          |
+  |  STREAM ONLY           |                                   |   Bounding boxes + UI       |
+  +------------------------+                                   +-----------------------------+
+            |                                                              |
+       captures + JPEG-encodes                                  pulls stream, runs YOLO,
+       (no model, no torch)                                     draws boxes, logs detections
+
+3.2 Communication protocol
+--------------------------
+- Transport: HTTP, multipart/x-mixed-replace; boundary=frame
+- Codec:     JPEG per frame (Motion JPEG / MJPEG)
+- Direction: PC initiates the connection (HTTP GET on /video_feed);
+             the Pi never pushes. This is firewall-friendly and avoids
+             the need for a discovery / signalling mechanism.
+- Port:      5000 (configurable via --port on stream.py)
+- Auxiliary endpoints exposed by the Pi:
+     /                index.html preview page
+     /video_feed      live MJPEG stream
+     /snapshot.jpg    single most-recent JPEG
+     /health          JSON: device, resolution, target FPS,
+                      measured FPS, frames total, uptime, has_frame
+- Authentication: none (trusted LAN deployment).
+
+3.3 Why pull and not push
+-------------------------
+A pull architecture means: the Pi has no notion of clients and does not
+have to maintain connection state, the PC can reconnect at will, and
+multiple PCs (or browsers) could read the same Pi independently. The
+Pi's Flask server is multi-threaded so concurrent reads do not starve
+the capture loop.
+
+3.4 Roles - strict separation
+-----------------------------
+  Raspberry Pi 4 (stream.py):
+    - opens the camera (cv2.VideoCapture)
+    - target capture: 640 x 480 @ 20 FPS, JPEG quality 80 (defaults)
+    - stores the latest JPEG behind a lock
+    - serves it over HTTP MJPEG
+    - imports flask + opencv ONLY. No torch, no ultralytics, no model.
+
+  Host PC (app.py):
+    - loads best.pt via Ultralytics YOLO (cached for the session)
+    - pulls the MJPEG stream with OpenCV's FFmpeg backend
+    - drains stale buffered frames (cv2.grab() / cv2.retrieve()) so the
+      displayed frame is always the most recent
+    - runs YOLOv8 prediction at user-chosen confidence / IoU / imgsz
+    - draws bounding boxes and class labels (PC-side, NOT Pi-side)
+    - logs detections to an in-memory rolling history (capped at 500)
+    - renders the Streamlit dashboard on localhost:8501
+
+3.5 Hardware
+------------
+  PC:
+    - CPU:   11 th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz
+    - GPU:     NVIDIA GeForce GTX 1650 with Max-Q Design
+    - RAM:    16gb
+    - OS:     Windows
+    - Python: 3.11
+
+  Raspberry Pi:
+    - Model:  Raspberry Pi 4 4 GB
+    - OS:     Raspberry Pi OS 
+    
+  Camera:
+    - Model:    Pi Camera v2
+    - Capture:   640 x 480 @ 20 fps
+    - JPEG q:   80 
+
+
+================================================================================
+4. DATASET AND TRAINING
+================================================================================
+
+4.1 Source
+----------
+Dataset:        https://www.kaggle.com/datasets/abdelouahabbella/moroccan-traffic-sign-detection?resource=download
+Image count:    <TOTAL - TBD>
+Splits:         train <N>, val <N>, test <N>
+Resolution:     <e.g. 640 x 640 after resize>
+Annotation:     YOLO format (.txt per image, class_id x y w h normalised)
+
+4.2 Classes
+-----------
+The model recognises <N - TBD> classes of Moroccan road signs. The
+class list is obtained directly from the trained weights:
+
+    from ultralytics import YOLO
+    m = YOLO("best.pt")
+    print(len(m.names), m.names)
+
+Class list (paste output here):
+   CLASS_NAMES = {
+    0: "Accès interdit aux motocycles",
+    1: "Sens giratoire obligatoire",
+    2: "Parc de stationnement",
+    3: "Circulation interdite dans les deux sens",
+    4: "Accès interdit aux véhicules de transport en commun de personnes",
+    5: "Le stationnement et/ou l'arrêt sont gênants. Le véhicule est susceptible d'une mise en fourrière.",
+    6: "Accès interdit aux cyclomoteurs",
+    7: "Traversée de voies de tramway",
+    8: "Travaux",
+    9: "Piste obligatoire pour cyclistes et cyclomoteurs",
+    10: "Contournement obligatoire par la droite",
+    11: "Arrêt d'autobus",
+    12: "Intersection d'une route prioritaire avec une route de moindre importance",
+    13: "Cédez le passage à l'intersection - signal de position",
+    14: "Accès interdit aux véhicules à traction animale",
+    15: "Rétrécissement ponctuel",
+    16: "Passage pour piétons",
+    17: "Endroit fréquenté par les enfants",
+    18: "Accès interdit aux véhicules affectés au transport de marchandises",
+    19: "Interdiction de dépasser",
+    20: "Interdiction de faire demi-tour",
+    21: "Interdiction de tourner à droite",
+    22: "Interdiction de tourner à gauche",
+    23: "Virage à droite",
+    24: "Virage à gauche",
+    25: "Arrêt au barrage de police",
+    26: "Stationnement interdit",
+    27: "Limitation de Vitesse",
+    28: "Stop",
+    29: "Passage d'animaux domestiques",
+    30: "Carrefour à sens giratoire",
+    31: "Succession de virages dont le premier est à gauche",
+    32: "Succession de virages dont le premier est à droite",
+    33: "Chaussée rétrécie",
+    34: "Sens interdit",
+    35: "Accès interdit aux véhicules dont la hauteur, chargement compris, est supérieure au nombre indiqué",
+    36: "Projection de gravillons",
+    37: "Arrêt au poste de douane",
+    38: "Direction obligatoire à la prochaine intersection à gauche",
+    39: "Accès interdit aux véhicules dont le poids total autorisé en charge ou le poids total roulant autorisé excède le nombre indiqué",
+    40: "Cassis ou dos d'âne",
+    41: "Direction obligatoire à la prochaine intersection tout droit",
+    42: "Accès interdit aux cycles",
+    43: "Arrêt et stationnement interdit",
+    44: "Chaussée submersible",
+    45: "Obligation de tourner à gauche avant le panneau",
+    46: "Cédez le passage à la circulation venant en sens inverse",
+    47: "Accès interdit aux piétons",
+    48: "Chaussée rétrécie par la gauche",
+    49: "Contrôle routier",
+    50: "Obligation de tourner à droite avant le panneau",
+    51: "Autres dangers",
+    52: "Contournement obligatoire par la gauche",
+    53: "Piste obligatoire pour cyclistes",
+    54: "Intersection de routes auxquelles s'applique la règle générale de priorité à droite",
+    55: "Interdiction aux véhicules de circuler sans maintenir entre eux un intervalle au moins égal au nombre indiqué",
+    56: "Voie réservée aux tramways",
+    57: "Montée à forte inclinaison",
+    58: "Interdiction de dépassement pour poids lourds",
+    59: "Cédez le passage à l'intersection - signal avancé du panneau stop",
+    60: "Ralentisseur type dos d'âne",
+    61: "Fin de limitation de Vitesse",
+    62: "Fin de toutes les interdictions précédemment signalées, imposées aux véhicules en mouvement",
+    63: "Signaux sonores interdits",
+    64: "Fin d'interdiction de dépasser",
+    65: "Risque d'incendie de forêt",
+    66: "Arrêt au barrage de gendarmerie",
+    67: "Serrez à droite",
+    68: "Directions obligatoires à la prochaine intersection à droite ou à gauche",
+    69: "Chaussée rétrécie par la droite",
+    70: "Accès interdit aux véhicules pesant, par essieu, plus que le nombre indiqué",
+    71: "Affectation de voies",
+    72: "Direction de déviation",
+    73: "Balisage de virages",
+}
+
+Examples include:
+    - Stop
+    - Cassis ou dos d'ane
+    - Piste obligatoire pour cyclistes
+
+4.3 Preprocessing and augmentation
+----------------------------------
+Standard Ultralytics defaults during training, unless otherwise noted:
+    - mosaic augmentation
+    - random horizontal flip
+    - HSV jitter (h, s, v)
+    - random scaling / translation
+    - random affine (small)
+
+Custom changes: <NONE / list any - TBD>
+
+
+
+================================================================================
+5. IMPLEMENTATION
+================================================================================
+
+5.1 Repository layout
+---------------------
+    traffic_sign_pc/
+      |- app.py               PC-side Streamlit dashboard + YOLO inference
+      |- stream.py            Pi-side Flask MJPEG streamer (camera-only)
+      |- best.pt              trained YOLOv8 weights
+      |- requirements_pc.txt  PC dependencies
+      |- requirements_rpi.txt Pi dependencies (no torch / no ultralytics)
+      |- snapshots/           auto-created folder for saved frames
+
+
+To collect these:
+
+    pip show streamlit ultralytics torch torchvision opencv-python \
+             numpy pandas pillow streamlit-webrtc av gtts
+
+
+5.4 Pi-side streamer (stream.py)
+--------------------------------
+- Camera abstraction: a thread-safe Camera class with a background
+  capture loop. Frames are read as fast as the hardware allows,
+  JPEG-encoded with cv2.imencode at quality 80, and stored under a lock.
+- Three Flask endpoints: /video_feed (MJPEG), /snapshot.jpg (single
+  JPEG), /health (JSON).
+- Multi-threaded Flask (threaded=True) lets multiple clients read
+  concurrently without starving the capture loop.
+- Optional systemd unit (roadguard-stream.service) auto-starts the
+  streamer on boot.
+
+5.5 PC-side dashboard (app.py)
+------------------------------
+The dashboard is a Streamlit application with three operating modes:
+
+    (a) Single Shot
+        - st.camera_input (browser camera) -> single still image
+        - YOLO predict -> annotated photo + per-detection list
+
+    (b) Continuous Live (WebRTC)
+        - streamlit-webrtc captures the browser camera and pipes frames
+          into a video_frame_callback running in a worker thread
+        - YOLO inference + box drawing happens inside the callback
+        - This is the lowest-latency mode for a local webcam
+
+    (c) Raspberry Pi Stream
+        - cv2.VideoCapture(<url>, cv2.CAP_FFMPEG) opens the MJPEG feed
+        - a draining loop (cv2.grab + cv2.retrieve) keeps only the
+          newest frame to avoid lag when YOLO is slower than capture
+        - YOLO inference + box drawing on PC
+        - throttled UI refresh: panels every 0.6 s, metrics every
+          0.25 s, video every iteration
+
+Common features across modes:
+    - light / dark theme toggle
+    - confidence / IoU / imgsz sliders
+    - class filter (post-NMS)
+    - mirror toggle
+    - manual snapshot button
+    - auto-save on high-confidence detections
+    - vocal alerts via gTTS (optional, browser plays MP3 inline)
+    - KPI cards: FPS, frames processed, total detections, inference (ms)
+    - Analytics: per-class detection counts (bar chart), confidence
+      distribution histogram
+    - History: rolling table (cap 500 rows), CSV export
+
+5.6 Inference pipeline (PC)
+---------------------------
+    frame -> [optional flip] -> YOLO.predict(conf, iou, imgsz)
+          -> per-detection rows (timestamp, class, confidence)
+          -> apply class filter (post-NMS)
+          -> draw_boxes(frame, kept boxes)  [PC-side, custom drawer]
+          -> resize to <= 960 px wide for browser
+          -> BGR -> RGB -> Streamlit image slot
+          -> append rows to in-memory history
+          -> alert + auto-save if max(conf) >= alert_threshold
+
+5.7 Detection logging
+---------------------
+The history is a Python list of dicts (capped at 500 rows). Each entry
+contains: Timestamp, Class, Confidence (formatted), Conf_Raw (float).
+The Class counter is a collections.Counter updated incrementally. CSV
+export is generated on demand from the current history.
+
+
+6.4 Discussion
+--------------
+- MJPEG over Wi-Fi adds <TBD ms> of latency on our LAN; this is
+  acceptable for a research prototype but would need to be reduced for
+  a real driver-assistance use case.
+- The class filter and confidence threshold significantly impact the
+  perceived responsiveness of the dashboard, since irrelevant low-
+  confidence detections are removed before drawing.
+
+
+
+
+================================================================================
+8. FUTURE WORK
+================================================================================
+
+  - Smaller / faster models. YOLOv8n or YOLOv8s, or quantised int8
+    variants, would give 5-10x speedups on CPU at modest accuracy cost.
+
+  - Edge inference on the Pi via Google Coral USB Accelerator or
+    Hailo-8L, eliminating the streaming round-trip entirely.
+
+  - Replace HTTP MJPEG with WebRTC end-to-end for lower latency and
+    better codec efficiency.
+
+  - Persistent storage of detections in SQLite (instead of in-memory)
+    so the system can run continuously without losing history.
+
+  - Geotagging by reading GPS over a USB receiver on the Pi and tagging
+    each detection with lat/long, then plotting on a map.
+
+  - Multi-camera support (front + rear) with per-camera analytics.
+
+  - Active-learning loop: auto-archive low-confidence frames for human
+    relabelling and iterative model improvement.
+
+  - Robustness work: night, rain, motion-blur datasets; out-of-
+    distribution detection.
+
+  - Mobile companion app subscribed to detections over WebSocket.
+
+
+================================================================================
+9. CONCLUSION
+================================================================================
+
+We built RoadGuard, a working two-tier Moroccan traffic-sign detection
+system that cleanly separates camera capture (Raspberry Pi) from
+inference and visualisation (PC). The Pi is a deliberately minimal
+MJPEG streamer with no deep-learning dependencies; the PC runs YOLOv8
+and a Streamlit dashboard that supports three modes, two themes,
+detection logging, analytics, snapshot capture, vocal alerts and CSV
+export. Real evaluation metrics are <TBD - paste from yolo val>; the
+end-to-end demo runs at <TBD FPS> on our hardware. The architecture is
+straightforward to scale - we discuss several concrete extensions in
+Section 8.
+
+
+================================================================================
+10. REFERENCES
+================================================================================
+
+[1]  J. Redmon and A. Farhadi. YOLOv3: An Incremental Improvement.
+     arXiv:1804.02767, 2018.
+
+[2]  Ultralytics. YOLOv8 Documentation.
+     https://docs.ultralytics.com/
+
+[3]  J. Stallkamp, M. Schlipsing, J. Salmen, C. Igel. The German
+     Traffic Sign Recognition Benchmark: A multi-class classification
+     competition. IJCNN, 2011.
+
+[4]  S. Houben et al. Detection of Traffic Signs in Real-World Images:
+     The German Traffic Sign Detection Benchmark. IJCNN, 2013.
+
+[5]  Streamlit. Streamlit Documentation.
+     https://docs.streamlit.io/
+
+[6]  streamlit-webrtc. Real-time video and audio streams over the
+     network for Streamlit. https://github.com/whitphx/streamlit-webrtc
+
+[7]  G. Bradski. The OpenCV Library. Dr. Dobb's Journal of Software
+     Tools, 2000.
+
+[8]  Flask Documentation. https://flask.palletsprojects.com/
+
+[9]  Raspberry Pi Foundation. Raspberry Pi 4 Datasheet.
+     https://www.raspberrypi.com/documentation/
+

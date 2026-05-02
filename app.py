@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import io
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -42,6 +43,12 @@ try:
     HAS_TTS = True
 except Exception:
     HAS_TTS = False
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except Exception:
+    HAS_REQUESTS = False
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +396,238 @@ def save_snapshot(frame_bgr: np.ndarray, suffix: str = "manual") -> Path:
 
 
 # ---------------------------------------------------------------------------
+# French -> English translation map for Moroccan traffic signs
+# ---------------------------------------------------------------------------
+# The dataset uses French class names. For the default English voice we
+# translate them to short English equivalents. Add or correct entries
+# here as you discover the exact class strings emitted by your model
+# (run: python -c "from ultralytics import YOLO; print(YOLO('best.pt').names)").
+TRANSLATIONS_FR_EN: dict[str, str] = {
+    "Stop": "stop sign",
+    "stop": "stop sign",
+    "Cassis ou dos d'ane": "speed bump",
+    "Cassis ou dos d'âne": "speed bump",
+    "Cassis": "speed bump",
+    "Dos d'ane": "speed bump",
+    "Dos d'âne": "speed bump",
+    "Piste obligatoire pour cyclistes": "mandatory cycle path",
+    "Piste cyclable": "cycle path",
+    "Sens interdit": "no entry",
+    "Cedez le passage": "yield",
+    "Cédez le passage": "yield",
+    "Limitation de vitesse": "speed limit",
+    "Interdiction de tourner a gauche": "no left turn",
+    "Interdiction de tourner à gauche": "no left turn",
+    "Interdiction de tourner a droite": "no right turn",
+    "Interdiction de tourner à droite": "no right turn",
+    "Interdiction de depasser": "no overtaking",
+    "Interdiction de dépasser": "no overtaking",
+    "Passage pieton": "pedestrian crossing",
+    "Passage piéton": "pedestrian crossing",
+    "Passage a niveau": "railway crossing",
+    "Passage à niveau": "railway crossing",
+    "Sens unique": "one way",
+    "Stationnement interdit": "no parking",
+    "Travaux": "roadworks",
+    "Virage a gauche": "left curve",
+    "Virage à gauche": "left curve",
+    "Virage a droite": "right curve",
+    "Virage à droite": "right curve",
+    "Virages": "curves ahead",
+    "Rond-point": "roundabout",
+    "Chaussee glissante": "slippery road",
+    "Chaussée glissante": "slippery road",
+    "Chaussee retrecie": "road narrows",
+    "Chaussée rétrécie": "road narrows",
+    "Feu tricolore": "traffic light",
+    "Enfants": "children crossing",
+    "Animaux sauvages": "wild animals",
+}
+
+
+def _localise_class(class_name: str, lang: str) -> str:
+    """Return the class name as it should be SPOKEN in the given lang.
+    For 'en' it tries the FR->EN dict, then falls back to the original
+    string so unknown classes still get announced (just in their
+    original French form)."""
+    if lang == "en":
+        return TRANSLATIONS_FR_EN.get(class_name, class_name)
+    # French (and any other) -> use the original class label as-is.
+    return class_name
+
+
+def _announce_phrase(class_name: str, lang: str) -> str:
+    """Build the full sentence the speaker will say."""
+    spoken = _localise_class(class_name, lang)
+    if lang == "fr":
+        return f"Panneau detecte: {spoken}"
+    # Default: English
+    return f"Detected {spoken}"
+
+
+# ---------------------------------------------------------------------------
+# Pi callback: fire-and-forget POST to the Pi's /announce endpoint
+# ---------------------------------------------------------------------------
+# THREAD-SAFE per-class cooldown state. Held at module level (not in
+# st.session_state) because the WebRTC video callback runs in a worker
+# thread that cannot reliably touch session_state.
+_NOTIFY_LOCK = threading.Lock()
+_NOTIFY_LAST: dict = {}  # class_name -> last-sent timestamp (epoch seconds)
+
+
+def _claim_notify_slot(class_name: str, cooldown_s: float) -> bool:
+    """Atomically check the per-class cooldown and reserve it.
+
+    Returns True if we are allowed to send now; False if still cooling
+    down. Safe to call from ANY thread.
+    """
+    now = time.time()
+    with _NOTIFY_LOCK:
+        last = _NOTIFY_LAST.get(class_name, 0.0)
+        if now - last < cooldown_s:
+            return False
+        _NOTIFY_LAST[class_name] = now
+    return True
+
+
+def notify_pi_async(url: str, class_name: str, text: str, lang: str,
+                    timeout: float = 2.0) -> None:
+    """POST the detected class + the exact spoken phrase to /announce.
+
+    The Pi uses `text` verbatim and `lang` as the gTTS language code,
+    so all translation/phrasing logic lives on the PC. `class_name`
+    is sent so the Pi can also dedup on it (defence in depth).
+
+    Fire-and-forget via a daemon thread.
+    """
+    if not HAS_REQUESTS or not url:
+        return
+
+    payload = {"class": class_name, "text": text, "lang": lang}
+
+    def _send():
+        try:
+            requests.post(url, json=payload, timeout=timeout)
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def maybe_notify_pi(cfg: dict, class_name: str) -> None:
+    """Auto-send the detected class to the Pi (English by default,
+    French if the user picked French in the sidebar). Applies a
+    per-class cooldown so the same sign is not repeated every frame.
+    Safe to call from any thread."""
+    if not cfg.get("notify_pi"):
+        return
+    url = cfg.get("notify_pi_url") or ""
+    if not url:
+        return
+    cooldown = float(cfg.get("notify_cooldown_s", 5.0))
+    if not _claim_notify_slot(class_name, cooldown):
+        return
+    lang = cfg.get("announce_lang", "en")
+    text = _announce_phrase(class_name, lang)
+    notify_pi_async(url, class_name, text, lang)
+
+
+# ---------------------------------------------------------------------------
+# Pi health status - polls /health every few seconds (cached) and renders
+# a coloured badge / strip in the dashboard.
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=4.0, show_spinner=False)
+def _fetch_pi_health_cached(rpi_ip: str, rpi_port: int) -> dict:
+    """Ping the Pi's /health endpoint, cached for 4 s.
+
+    Cached so we don't spam the Pi every Streamlit rerun. TTL means
+    the badge auto-refreshes within ~4 s of any state change.
+    """
+    if not rpi_ip or not HAS_REQUESTS:
+        return {"ok": False, "reason": "no_pi_or_no_requests"}
+    url = f"http://{rpi_ip}:{rpi_port}/health"
+    try:
+        r = requests.get(url, timeout=1.5)
+        if r.ok:
+            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            return {"ok": True, **data}
+        return {"ok": False, "reason": f"http_{r.status_code}"}
+    except requests.exceptions.ConnectTimeout:
+        return {"ok": False, "reason": "timeout"}
+    except requests.exceptions.ConnectionError:
+        return {"ok": False, "reason": "unreachable"}
+    except Exception as e:
+        return {"ok": False, "reason": type(e).__name__}
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds or 0)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    h, rem = divmod(s, 3600)
+    return f"{h}h {rem // 60}m"
+
+
+def _pi_health_badge_html(h: dict, rpi_ip: str, rpi_port: int) -> str:
+    """Compact one-liner for the sidebar."""
+    if h.get("ok"):
+        fps = h.get("measured_fps") or 0.0
+        has_frame = h.get("has_frame", False)
+        if has_frame and fps > 0:
+            cls, label = "rg-pill-ok", f"Pi online - {fps:.1f} fps"
+        else:
+            cls, label = "rg-pill-warn", "Pi online (no frames yet)"
+    else:
+        reason = h.get("reason", "offline")
+        cls, label = "rg-pill-err", f"Pi offline - {reason}"
+    return (f'<div style="margin:.4rem 0;font-size:.82rem;">'
+            f'<span class="rg-pill {cls}">{label}</span>'
+            f'</div>')
+
+
+def render_pi_health_strip(rpi_ip: str, rpi_port: int) -> None:
+    """Bigger info card shown on the main page header. No-op if the
+    user has not set a Pi IP."""
+    if not rpi_ip:
+        return
+    h = _fetch_pi_health_cached(rpi_ip, rpi_port)
+    if h.get("ok"):
+        fps = h.get("measured_fps") or 0.0
+        res = f"{h.get('width', '?')}x{h.get('height', '?')}"
+        target_fps = h.get("target_fps", "?")
+        uptime = _format_uptime(h.get("uptime_s", 0))
+        frames = h.get("frames_total", "?")
+        has_frame = h.get("has_frame", False)
+        dot = "var(--rg-ok)" if (has_frame and fps > 0) else "var(--rg-warn)"
+        status_word = "ONLINE" if (has_frame and fps > 0) else "ONLINE (idle)"
+        body = (
+            f"<strong>Pi {status_word}</strong> &middot; "
+            f"<code>{rpi_ip}:{rpi_port}</code> &middot; "
+            f"capture {fps:.1f}/{target_fps} fps &middot; "
+            f"{res} &middot; "
+            f"frames {frames} &middot; "
+            f"uptime {uptime}"
+        )
+    else:
+        dot = "var(--rg-err)"
+        reason = h.get("reason", "offline")
+        body = (f"<strong>Pi OFFLINE</strong> &middot; "
+                f"<code>{rpi_ip}:{rpi_port}</code> &middot; "
+                f"reason: {reason}")
+    st.markdown(
+        f'<div class="rg-card" style="display:flex;align-items:center;'
+        f'gap:.7rem;margin-bottom:1rem;">'
+        f'<span style="display:inline-block;width:10px;height:10px;'
+        f'border-radius:50%;background:{dot};box-shadow:0 0 6px {dot};"></span>'
+        f'<span style="font-size:.9rem;">{body}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading YOLO weights...")
@@ -470,6 +709,7 @@ def init_state():
     ss.setdefault("last_annotated", None)
     ss.setdefault("snapshot_request", False)
     ss.setdefault("last_spoken", "")
+    ss.setdefault("last_pi_notify", {})  # class_name -> last-sent timestamp
 
 
 def reset_history():
@@ -519,13 +759,24 @@ def sidebar(class_names: list[str]) -> dict:
             mode_opts.remove("Continuous Live (WebRTC)")
         mode = st.radio("Detection Mode", options=mode_opts, index=0)
 
-        # ---- RPi config (only if RPi mode) ----------------------------
-        rpi_ip, rpi_port, rpi_path = "", 5000, "/video_feed"
+        # ---- Pi connection (always shown - used for stream, speaker
+        #      callback, AND health badge regardless of mode) ----------
+        st.markdown("**Pi connection**")
+        rpi_ip = st.text_input("Pi IP Address", value="10.126.210.103",
+                               help="LAN IP of the Pi running stream.py. "
+                                    "Used by RPi mode AND by the Pi-speaker "
+                                    "callback in any mode.")
+        rpi_port = st.number_input("Port", min_value=1, max_value=65535,
+                                   value=5000, step=1)
+        rpi_path = "/video_feed"
         if mode == "Raspberry Pi Stream":
-            rpi_ip = st.text_input("Pi IP Address", value="10.126.210.103")
-            rpi_port = st.number_input("Port", min_value=1, max_value=65535,
-                                       value=5000, step=1)
             rpi_path = st.text_input("Stream Path", value="/video_feed")
+
+        # ---- Pi health badge ------------------------------------------
+        if rpi_ip:
+            health = _fetch_pi_health_cached(rpi_ip.strip(), int(rpi_port))
+            st.markdown(_pi_health_badge_html(health, rpi_ip, int(rpi_port)),
+                        unsafe_allow_html=True)
 
         st.divider()
 
@@ -551,14 +802,60 @@ def sidebar(class_names: list[str]) -> dict:
         # ---- Capture & alerts -----------------------------------------
         st.markdown("### Capture & Alerts")
         mirror = st.checkbox("Mirror frame", value=False)
-        vocal = st.toggle("Vocal Alerts", value=False,
+        vocal = st.toggle("Vocal Alerts (browser)", value=False,
                           disabled=not HAS_TTS,
-                          help="Speaks the top detected class. "
-                               + ("" if HAS_TTS else "Install gtts to enable."))
+                          help="Speaks the top detected class through "
+                               "the browser. " +
+                               ("" if HAS_TTS else "Install gtts to enable."))
         save_on_detect = st.checkbox(
             "Auto-save high-confidence snapshots", value=False)
         alert_thr = st.slider("Alert / Auto-save Threshold",
                               0.30, 0.99, 0.75, 0.01)
+
+        st.divider()
+
+        # ---- Pi speaker (PC -> Pi callback) ---------------------------
+        st.markdown("### Pi Speaker")
+        notify_pi = st.toggle(
+            "Send detections to Pi speaker",
+            value=False,
+            disabled=not HAS_REQUESTS,
+            help="POSTs each high-confidence detection to the Pi's "
+                 "/announce endpoint so a speaker connected to the Pi "
+                 "speaks the class name. " +
+                 ("" if HAS_REQUESTS else "Install 'requests' to enable."),
+        )
+        # Default URL is built from the RPi config above (works even
+        # outside RPi mode, e.g. you can run Single Shot on the PC
+        # and still let the Pi speak).
+        default_announce_url = (
+            f"http://{rpi_ip}:{rpi_port}/announce" if rpi_ip
+            else "http://<rpi-ip>:5000/announce"
+        )
+        notify_pi_url = st.text_input(
+            "Pi /announce URL",
+            value=default_announce_url,
+            disabled=not notify_pi,
+        )
+        notify_cooldown_s = st.slider(
+            "Pi announce cooldown (s)",
+            min_value=1, max_value=30, value=5, step=1,
+            disabled=not notify_pi,
+            help="Per-class cooldown applied on the PC side. The Pi "
+                 "applies its own cooldown too (default 3 s).",
+        )
+        announce_lang_label = st.radio(
+            "Announce language",
+            options=["English", "French"],
+            index=0,
+            horizontal=True,
+            disabled=not notify_pi,
+            help="English: French class names are translated to short "
+                 "English equivalents (e.g. 'Cassis ou dos d'âne' "
+                 "becomes 'speed bump'). French: the original French "
+                 "label is spoken with a French voice.",
+        )
+        announce_lang = "fr" if announce_lang_label == "French" else "en"
 
         st.divider()
 
@@ -583,6 +880,10 @@ def sidebar(class_names: list[str]) -> dict:
         vocal=bool(vocal),
         save_on_detect=bool(save_on_detect),
         alert_thr=float(alert_thr),
+        notify_pi=bool(notify_pi),
+        notify_pi_url=notify_pi_url.strip(),
+        notify_cooldown_s=float(notify_cooldown_s),
+        announce_lang=announce_lang,
     )
 
 
@@ -622,6 +923,11 @@ def render_single_shot(model, cfg: dict):
         top = max(rows, key=lambda r: r["Conf_Raw"])
         save_snapshot(annotated, suffix=f"auto_{top['Class'].replace(' ','_')}")
 
+    # Send to Pi speaker - only on high-confidence to avoid noise
+    if rows and max_conf >= cfg["alert_thr"]:
+        top = max(rows, key=lambda r: r["Conf_Raw"])
+        maybe_notify_pi(cfg, top["Class"])
+
     col1, col2 = st.columns([2, 1])
     with col1:
         st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
@@ -643,7 +949,9 @@ def render_single_shot(model, cfg: dict):
 def render_webrtc(model, cfg: dict):
     st.markdown('<div class="rg-section-title">Continuous Live Stream</div>',
                 unsafe_allow_html=True)
-    st.caption("Browser camera streamed via WebRTC. Inference runs on the PC.")
+    st.caption("Browser camera streamed via WebRTC. Inference runs on the PC. "
+               "If the Pi-speaker toggle is on, every high-confidence "
+               "detection is auto-sent to the Pi - no clicks needed.")
 
     keep = cfg["selected_classes"] or None
 
@@ -651,10 +959,17 @@ def render_webrtc(model, cfg: dict):
         img = frame.to_ndarray(format="bgr24")
         if cfg["mirror"]:
             img = cv2.flip(img, 1)
-        annotated, _rows, _maxc, _t = predict_and_draw(
+        annotated, rows, max_conf, _t = predict_and_draw(
             model, img, cfg["conf"], cfg["iou"], cfg["imgsz"],
             keep_classes=keep,
         )
+        # Auto-send to Pi speaker. This runs in a WebRTC worker thread,
+        # so we use the thread-safe module-level cooldown (NOT
+        # st.session_state). No user click needed - just the toggle in
+        # the sidebar.
+        if cfg["notify_pi"] and rows and max_conf >= cfg["alert_thr"]:
+            top = max(rows, key=lambda r: r["Conf_Raw"])
+            maybe_notify_pi(cfg, top["Class"])
         return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
     webrtc_streamer(
@@ -671,7 +986,7 @@ def render_webrtc(model, cfg: dict):
     st.info(
         "Live history & analytics aren't logged in WebRTC mode (the callback "
         "runs in a worker thread). Use Single Shot or RPi Stream to populate "
-        "the history table."
+        "the history table. The Pi-speaker callback DOES work here."
     )
 
 
@@ -813,6 +1128,10 @@ def render_rpi(model, cfg: dict):
                 if cfg["save_on_detect"]:
                     save_snapshot(annotated,
                                   suffix=f"auto_{top['Class'].replace(' ','_')}")
+                # Tell the Pi to speak the detected class through its
+                # local speaker (cooldown applied per-class on both
+                # PC and Pi sides so we don't spam).
+                maybe_notify_pi(cfg, top["Class"])
             else:
                 alert_slot.empty()
 
@@ -941,6 +1260,10 @@ def main():
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    # Pi health card - shows live connection status + capture FPS,
+    # auto-refreshed via @st.cache_data(ttl=4s).
+    render_pi_health_strip(cfg["rpi_ip"], cfg["rpi_port"])
 
     # KPI row (snapshot of session counters; updates next rerun)
     render_kpi_row()
