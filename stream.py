@@ -85,13 +85,19 @@ class Camera:
 
     def __init__(
         self,
-        device: int = 0,
+        device=0,                # int (local /dev/videoN) OR a URL string
         width: int = 640,
         height: int = 480,
         target_fps: int = 20,
         jpeg_quality: int = 80,
     ) -> None:
-        self.device = device
+        # `device` can be either an integer (V4L2 index) or a string URL
+        # (e.g. an ESP32-CAM MJPEG stream "http://192.168.1.42:81/stream").
+        # cv2.VideoCapture accepts both transparently.
+        try:
+            self.device = int(device)
+        except (TypeError, ValueError):
+            self.device = str(device)
         self.width = width
         self.height = height
         self.target_fps = target_fps
@@ -105,6 +111,16 @@ class Camera:
         self._frame_times: deque = deque(maxlen=60)
         self._frames_total = 0
         self._started_at = time.time()
+        # Actual frame dimensions, populated on first successful decode.
+        # For URL sources (ESP32-CAM, IP cams) the upstream decides the
+        # resolution, so the requested width/height are merely hints.
+        self._actual_w: Optional[int] = None
+        self._actual_h: Optional[int] = None
+
+    # -- helpers -------------------------------------------------------------
+    def _is_url_device(self) -> bool:
+        """True if device is a remote stream URL (http://, rtsp://, etc.)."""
+        return isinstance(self.device, str) and "://" in self.device.lower()
 
     # -- public --------------------------------------------------------------
     def start(self) -> None:
@@ -132,10 +148,19 @@ class Camera:
             fps = (len(ft) - 1) / elapsed if elapsed > 0 else 0.0
         else:
             fps = 0.0
+        # Prefer the actual decoded frame size (correct for ESP32-CAM /
+        # any URL source where upstream picks the resolution), and fall
+        # back to the requested width/height for local cams before we've
+        # decoded the first frame.
+        actual_w = self._actual_w if self._actual_w is not None else self.width
+        actual_h = self._actual_h if self._actual_h is not None else self.height
         return dict(
             device=self.device,
-            width=self.width,
-            height=self.height,
+            source_kind="url" if self._is_url_device() else "local",
+            width=actual_w,
+            height=actual_h,
+            requested_width=self.width,
+            requested_height=self.height,
             target_fps=self.target_fps,
             measured_fps=round(fps, 2),
             frames_total=self._frames_total,
@@ -146,12 +171,38 @@ class Camera:
 
     # -- internal ------------------------------------------------------------
     def _open(self) -> bool:
-        cap = cv2.VideoCapture(self.device)
+        # For network sources (ESP32-CAM, IP cams, etc.) prefer the
+        # FFmpeg backend, but fall back to the default backend if the
+        # OpenCV build on the Pi was compiled without FFmpeg support
+        # (common with `apt install python3-opencv`). For local devices
+        # let OpenCV pick.
+        if self._is_url_device():
+            cap = cv2.VideoCapture(self.device, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                log.warning(
+                    "FFmpeg backend could not open %s; retrying with default backend.",
+                    self.device,
+                )
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = cv2.VideoCapture(self.device)
+        else:
+            cap = cv2.VideoCapture(self.device)
         if not cap.isOpened():
             return False
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        # FRAME_WIDTH/HEIGHT/FPS only apply to local cams. For URL
+        # sources the upstream device (ESP32-CAM, IP cam) decides the
+        # resolution, and calling these on the FFmpeg backend can emit
+        # noisy warnings on some builds, so skip them entirely.
+        if not self._is_url_device():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        # Always cap the internal buffer so we serve fresh frames even
+        # when the upstream FPS exceeds what we can encode/serve. This
+        # is critical for URL sources to avoid ever-growing latency.
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -170,6 +221,7 @@ class Camera:
     def _loop(self) -> None:
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         period = 1.0 / max(1, self.target_fps)
+        is_url = self._is_url_device()
 
         while not self._stop.is_set():
             if self._cap is None or not self._cap.isOpened():
@@ -178,8 +230,9 @@ class Camera:
                 if not self._open():
                     time.sleep(1.0)
                     continue
-                log.info("Camera %s opened (%dx%d @ %d fps target).",
-                         self.device, self.width, self.height, self.target_fps)
+                log.info("Camera %s opened (kind=%s, %dx%d @ %d fps target).",
+                         self.device, "url" if is_url else "local",
+                         self.width, self.height, self.target_fps)
 
             t0 = time.time()
             ok, frame = self._cap.read()
@@ -188,6 +241,16 @@ class Camera:
                 self._release()
                 time.sleep(0.5)
                 continue
+
+            # Capture actual decoded size once (for /health reporting).
+            if self._actual_w is None or self._actual_h is None:
+                try:
+                    h, w = frame.shape[:2]
+                    self._actual_h, self._actual_w = int(h), int(w)
+                    if is_url:
+                        log.info("Upstream resolution detected: %dx%d", w, h)
+                except Exception:
+                    pass
 
             ok, buf = cv2.imencode(".jpg", frame, encode_params)
             if not ok:
@@ -198,9 +261,15 @@ class Camera:
             self._frame_times.append(time.time())
             self._frames_total += 1
 
-            elapsed = time.time() - t0
-            if elapsed < period:
-                time.sleep(period - elapsed)
+            # FPS throttle: only meaningful for local cameras where we
+            # actually drive capture rate. For URL sources the upstream
+            # decides cadence, and sleeping here just lets frames pile
+            # up in the socket buffer (= growing latency). With
+            # CAP_PROP_BUFFERSIZE=1 we always serve the freshest frame.
+            if not is_url:
+                elapsed = time.time() - t0
+                if elapsed < period:
+                    time.sleep(period - elapsed)
 
         self._release()
 
@@ -565,7 +634,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="RoadGuard MJPEG streamer for Raspberry Pi 4 (camera-only)"
     )
-    p.add_argument("--device", type=int, default=0, help="Camera index (default 0)")
+    p.add_argument(
+        "--device", type=str, default="0",
+        help=("Camera source. Either an integer V4L2 index ('0' for "
+              "/dev/video0, default) OR a URL to an MJPEG stream "
+              "(e.g. 'http://192.168.1.42:81/stream' for an ESP32-CAM)."),
+    )
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=20, help="Target capture FPS")
