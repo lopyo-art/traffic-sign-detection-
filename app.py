@@ -2,12 +2,12 @@
 RoadGuard - Real-time Moroccan Traffic Sign Detection Dashboard
 ================================================================
 Three modes:
-  * Single Shot      - st.camera_input -> YOLO -> annotated photo
+  * Image Demo       - upload, included image or browser camera -> YOLO
   * Continuous Live  - streamlit-webrtc -> YOLO in callback (low latency)
   * Raspberry Pi     - pull MJPEG stream from stream.py, run YOLO on PC
 
-The Pi (stream.py) is camera-only. ALL detection, bounding boxes and
-labels are drawn on the PC.
+The Pi (stream.py) streams frames; detection, bounding boxes and labels
+are produced by the Streamlit host (local computer or cloud server).
 
 Run:
     streamlit run app.py
@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 # Optional deps - degrade gracefully if missing
 try:
@@ -62,6 +62,7 @@ st.set_page_config(
 )
 
 MODEL_PATH = Path(__file__).parent / "best.pt"
+SAMPLE_PATH = Path(__file__).parent / "sample_images" / "illustrative_stop.png"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
@@ -73,6 +74,7 @@ READ_TIMEOUT_S = 5.0
 PANEL_INTERVAL_S = 0.6
 METRIC_INTERVAL_S = 0.25
 DISPLAY_MAX_WIDTH = 960
+MODEL_INFERENCE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -650,8 +652,10 @@ def predict_and_draw(model, frame_bgr: np.ndarray, conf: float, iou: float,
                      imgsz: int, keep_classes: Optional[set] = None):
     """Returns (annotated_bgr, rows, max_conf, infer_t_s)."""
     t0 = time.time()
-    results = model.predict(frame_bgr, conf=conf, iou=iou, imgsz=imgsz,
-                            verbose=False)
+    # The cached model is shared across sessions and WebRTC worker threads.
+    with MODEL_INFERENCE_LOCK:
+        results = model.predict(frame_bgr, conf=conf, iou=iou, imgsz=imgsz,
+                                verbose=False)
     infer_t = time.time() - t0
     if not results:
         return frame_bgr, [], 0.0, infer_t
@@ -710,6 +714,7 @@ def init_state():
     ss.setdefault("snapshot_request", False)
     ss.setdefault("last_spoken", "")
     ss.setdefault("last_pi_notify", {})  # class_name -> last-sent timestamp
+    ss.setdefault("image_result", None)
 
 
 def reset_history():
@@ -719,6 +724,8 @@ def reset_history():
     st.session_state.total_frames = 0
     st.session_state.total_detections = 0
     st.session_state.class_counts = Counter()
+    st.session_state.image_result = None
+    st.session_state.last_annotated = None
 
 
 def append_history(rows: list) -> None:
@@ -754,31 +761,10 @@ def sidebar(class_names: list[str]) -> dict:
         st.divider()
 
         # ---- Mode ------------------------------------------------------
-        mode_opts = ["Single Shot", "Continuous Live (WebRTC)", "Raspberry Pi Stream"]
+        mode_opts = ["Image Demo", "Continuous Live (WebRTC)", "Raspberry Pi Stream"]
         if not HAS_WEBRTC:
             mode_opts.remove("Continuous Live (WebRTC)")
         mode = st.radio("Detection Mode", options=mode_opts, index=0)
-
-        # ---- Pi connection (always shown - used for stream, speaker
-        #      callback, AND health badge regardless of mode) ----------
-        st.markdown("**Pi connection**")
-        rpi_ip = st.text_input("Pi IP Address", value="10.126.210.103",
-                               help="LAN IP of the Pi running stream.py. "
-                                    "Used by RPi mode AND by the Pi-speaker "
-                                    "callback in any mode.")
-        rpi_port = st.number_input("Port", min_value=1, max_value=65535,
-                                   value=5000, step=1)
-        rpi_path = "/video_feed"
-        if mode == "Raspberry Pi Stream":
-            rpi_path = st.text_input("Stream Path", value="/video_feed")
-
-        # ---- Pi health badge ------------------------------------------
-        if rpi_ip:
-            health = _fetch_pi_health_cached(rpi_ip.strip(), int(rpi_port))
-            st.markdown(_pi_health_badge_html(health, rpi_ip, int(rpi_port)),
-                        unsafe_allow_html=True)
-
-        st.divider()
 
         # ---- Detection params -----------------------------------------
         st.markdown("### Detection")
@@ -825,12 +811,28 @@ def sidebar(class_names: list[str]) -> dict:
                  "speaks the class name. " +
                  ("" if HAS_REQUESTS else "Install 'requests' to enable."),
         )
-        # Default URL is built from the RPi config above (works even
-        # outside RPi mode, e.g. you can run Single Shot on the PC
-        # and still let the Pi speak).
+        # Only contact the Pi when its stream or speaker feature is selected.
+        rpi_ip = ""
+        rpi_port = 5000
+        rpi_path = "/video_feed"
+        if mode == "Raspberry Pi Stream" or notify_pi:
+            st.markdown("**Local Raspberry Pi connection**")
+            rpi_ip = st.text_input("Pi IP Address", value="",
+                                   placeholder="192.168.1.50",
+                                   help="Address reachable from the machine running Streamlit. "
+                                        "A hosted app cannot reach a private home LAN address.")
+            rpi_port = int(st.number_input("Port", min_value=1, max_value=65535,
+                                           value=5000, step=1))
+            if mode == "Raspberry Pi Stream":
+                rpi_path = st.text_input("Stream Path", value="/video_feed")
+            if rpi_ip and mode == "Raspberry Pi Stream":
+                health = _fetch_pi_health_cached(rpi_ip.strip(), rpi_port)
+                st.markdown(_pi_health_badge_html(health, rpi_ip, rpi_port),
+                            unsafe_allow_html=True)
+        # An explicit URL can also target a separately secured Pi endpoint.
         default_announce_url = (
             f"http://{rpi_ip}:{rpi_port}/announce" if rpi_ip
-            else "http://<rpi-ip>:5000/announce"
+            else ""
         )
         notify_pi_url = st.text_input(
             "Pi /announce URL",
@@ -862,10 +864,10 @@ def sidebar(class_names: list[str]) -> dict:
         if st.button("Clear History", use_container_width=True):
             reset_history()
 
-        st.caption(
-            "Pi role: stream raw frames only. "
-            "PC role: YOLO inference, bounding boxes, labels, analytics."
-        )
+        st.caption("Inference runs where this Streamlit app is hosted. "
+                   "For Pi streaming, run the app on a computer on the same LAN.")
+        st.caption("Saved snapshots stay on that host. Use the image result's "
+                   "Download button to keep a copy on your device.")
 
     return dict(
         mode=mode,
@@ -888,17 +890,84 @@ def sidebar(class_names: list[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Mode 1: Single Shot
+# Mode 1: Image demo
 # ---------------------------------------------------------------------------
-def render_single_shot(model, cfg: dict):
-    st.markdown('<div class="rg-section-title">Single Shot Capture</div>',
-                unsafe_allow_html=True)
-    img_buffer = st.camera_input("Take a photo", label_visibility="collapsed")
-    if not img_buffer:
-        return
+def decode_image(raw: bytes) -> np.ndarray:
+    """Decode a user image to BGR, rejecting oversized or malformed inputs."""
+    if len(raw) > 12 * 1024 * 1024:
+        raise ValueError("Image exceeds 12 MB. Please use a smaller photo.")
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.width * image.height > 12_000_000:
+                raise ValueError("Image exceeds 12 megapixels. Resize it first.")
+            rgb = ImageOps.exif_transpose(image).convert("RGB")
+            return np.ascontiguousarray(np.array(rgb)[:, :, ::-1])
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("This file could not be opened as an image.") from exc
 
-    pil = Image.open(img_buffer).convert("RGB")
-    arr = np.array(pil)[:, :, ::-1]  # RGB -> BGR
+
+def render_image_demo(model, cfg: dict):
+    st.markdown('<div class="rg-section-title">Try a road sign image</div>',
+                unsafe_allow_html=True)
+    st.caption("Choose the included test image, upload your own photo, or use your camera. "
+               "Detection runs only when you press the button.")
+    source = st.radio("Image source", ["Included sample", "Upload image", "Camera"],
+                      horizontal=True, key="image_source")
+    raw = None
+    if source == "Included sample":
+        if SAMPLE_PATH.exists():
+            raw = SAMPLE_PATH.read_bytes()
+            st.image(raw, caption="Illustrative test image (drawn for this demo; "
+                     "it is not a measured detection result)", width=520)
+        else:
+            st.info("No included image is available. Choose Upload image instead.")
+    elif source == "Upload image":
+        image_file = st.file_uploader("Choose a JPG, PNG, or WebP photo",
+                                      type=["jpg", "jpeg", "png", "webp"])
+        if image_file is not None:
+            raw = image_file.getvalue()
+    else:
+        camera_file = st.camera_input("Take a photo")
+        if camera_file is not None:
+            raw = camera_file.getvalue()
+
+    if st.button("Run detection", type="primary", disabled=raw is None):
+        try:
+            arr = decode_image(raw)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        with st.spinner("Detecting signs..."):
+            _run_image_detection(model, cfg, arr, source)
+
+    result = st.session_state.image_result
+    if result is None:
+        return
+    annotated, rows, infer_t, result_source = result
+    st.caption(f"Latest result: {result_source}. Run detection again after changing "
+               "the image or settings.")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                 use_container_width=True)
+    with col2:
+        st.metric("Signs Found", len(rows))
+        st.metric("Inference (ms)", f"{infer_t * 1000:.0f}")
+        if not rows:
+            st.info("No sign passed the confidence threshold in this image.")
+        for r in rows[:8]:
+            st.success(f"{r['Class']} - {r['Confidence']}")
+        st.download_button("Download annotated image",
+                           data=cv2.imencode(".png", annotated)[1].tobytes(),
+                           file_name="roadguard_result.png", mime="image/png",
+                           use_container_width=True)
+        if st.button("Save snapshot", use_container_width=True,
+                     key="single_save_btn"):
+            p = save_snapshot(annotated, suffix="single")
+            st.success(f"Saved: {p.name}")
+
+
+def _run_image_detection(model, cfg: dict, arr: np.ndarray, source: str):
     if cfg["mirror"]:
         arr = cv2.flip(arr, 1)
 
@@ -910,6 +979,7 @@ def render_single_shot(model, cfg: dict):
     st.session_state.total_frames += 1
     st.session_state.inference_times.append(infer_t)
     st.session_state.last_annotated = annotated
+    st.session_state.image_result = (annotated, rows, infer_t, source)
 
     if cfg["vocal"] and rows:
         top = max(rows, key=lambda r: r["Conf_Raw"])
@@ -928,28 +998,13 @@ def render_single_shot(model, cfg: dict):
         top = max(rows, key=lambda r: r["Conf_Raw"])
         maybe_notify_pi(cfg, top["Class"])
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
-                 use_container_width=True)
-    with col2:
-        st.metric("Signs Found", len(rows))
-        st.metric("Inference (ms)", f"{infer_t * 1000:.0f}")
-        for r in rows[:8]:
-            st.success(f"{r['Class']} - {r['Confidence']}")
-        if st.button("Save snapshot", use_container_width=True,
-                     key="single_save_btn"):
-            p = save_snapshot(annotated, suffix="single")
-            st.success(f"Saved: {p.name}")
-
-
 # ---------------------------------------------------------------------------
 # Mode 2: Continuous Live via WebRTC
 # ---------------------------------------------------------------------------
 def render_webrtc(model, cfg: dict):
     st.markdown('<div class="rg-section-title">Continuous Live Stream</div>',
                 unsafe_allow_html=True)
-    st.caption("Browser camera streamed via WebRTC. Inference runs on the PC. "
+    st.caption("Browser camera streamed via WebRTC. Inference runs on the Streamlit host. "
                "If the Pi-speaker toggle is on, every high-confidence "
                "detection is auto-sent to the Pi - no clicks needed.")
 
@@ -985,7 +1040,7 @@ def render_webrtc(model, cfg: dict):
 
     st.info(
         "Live history & analytics aren't logged in WebRTC mode (the callback "
-        "runs in a worker thread). Use Single Shot or RPi Stream to populate "
+        "runs in a worker thread). Use Image Demo or RPi Stream to populate "
         "the history table. The Pi-speaker callback DOES work here."
     )
 
@@ -1250,12 +1305,15 @@ def main():
     _apply_theme()
 
     # Hero
-    badges_html = ('<span class="rg-badge">Pi: stream only</span>'
-                   '<span class="rg-badge">PC: detection &amp; UI</span>')
+    badges_html = ('<span class="rg-badge">Pi: camera &amp; speaker</span>'
+                   '<span class="rg-badge">Local computer: detection</span>'
+                   if cfg["mode"] == "Raspberry Pi Stream" else
+                   '<span class="rg-badge">Upload or try a sample</span>'
+                   '<span class="rg-badge">Camera optional</span>')
     st.markdown(
         f'<div class="rg-header">'
         f'<h1>RoadGuard</h1>'
-        f'<div class="sub">Moroccan Traffic Sign Detection - YOLOv8 on PC</div>'
+        f'<div class="sub">Moroccan Traffic Sign Detection</div>'
         f'<div class="badges">{badges_html}</div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -1263,20 +1321,26 @@ def main():
 
     # Pi health card - shows live connection status + capture FPS,
     # auto-refreshed via @st.cache_data(ttl=4s).
-    render_pi_health_strip(cfg["rpi_ip"], cfg["rpi_port"])
-
-    # KPI row (snapshot of session counters; updates next rerun)
-    render_kpi_row()
+    if cfg["mode"] == "Raspberry Pi Stream":
+        st.info("Local hardware mode: run Streamlit on a computer that can reach "
+                "your Pi over the same network. A hosted instance cannot reach "
+                "a private Pi address.")
+        if cfg["rpi_ip"]:
+            render_pi_health_strip(cfg["rpi_ip"], cfg["rpi_port"])
 
     st.divider()
 
     # Mode-specific main view
-    if cfg["mode"] == "Single Shot":
-        render_single_shot(model, cfg)
+    if cfg["mode"] == "Image Demo":
+        render_image_demo(model, cfg)
     elif cfg["mode"] == "Continuous Live (WebRTC)":
         render_webrtc(model, cfg)
     else:
         render_rpi(model, cfg)
+
+    if st.session_state.total_frames:
+        st.divider()
+        render_kpi_row()
 
     st.divider()
 
