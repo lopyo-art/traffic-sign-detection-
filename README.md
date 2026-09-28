@@ -1,5 +1,7 @@
 # RoadGuard — Moroccan traffic sign detection
 
+[**Try the live demo**](https://roadguard-morocco.streamlit.app/)
+
 RoadGuard is a Streamlit dashboard for a custom YOLO model. It can detect signs in an uploaded image, an included test image, a browser camera feed, or frames streamed from a Raspberry Pi 4. The Pi captures video and can announce high-confidence detections through its configured audio output. Inference runs on the machine hosting Streamlit; `stream.py` does not run the model.
 
 ## Try the dashboard
