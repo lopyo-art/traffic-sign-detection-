@@ -1,11 +1,11 @@
 # RoadGuard — Moroccan traffic sign detection
 
-RoadGuard is a Streamlit dashboard for a custom YOLO model. It can detect signs in an uploaded image, an included illustrative image, a browser camera feed, or frames streamed from a Raspberry Pi 4. The Pi captures video and can announce high-confidence detections through its configured audio output. Inference runs on the machine hosting Streamlit; `stream.py` does not run the model.
+RoadGuard is a Streamlit dashboard for a custom YOLO model. It can detect signs in an uploaded image, an included test image, a browser camera feed, or frames streamed from a Raspberry Pi 4. The Pi captures video and can announce high-confidence detections through its configured audio output. Inference runs on the machine hosting Streamlit; `stream.py` does not run the model.
 
 ## Try the dashboard
 
 1. Open the dashboard. **Image Demo** is the default mode.
-2. Select **Included sample** or **Upload image**. The included STOP sign illustration is a pipeline test, not a photographed road sign or evidence of model accuracy.
+2. Select **Included sample** or **Upload image**. The included STOP sign image is a test input, not evidence of model accuracy.
 3. Press **Run detection**. Inspect the annotated image, class labels, confidence values, and inference time. A valid image can produce zero detections.
 4. Use **Download annotated image** to keep the result. The **Camera** source requests browser permission only if selected.
 
@@ -20,7 +20,7 @@ A hosted Streamlit app performs inference on its cloud server. It cannot normall
 | `app.py` | Streamlit interface and model inference |
 | `stream.py` | Raspberry Pi Flask camera stream and optional speech endpoint |
 | `best.pt` | Trained model weights |
-| `sample_images/illustrative_stop.png` | Synthetic input for testing the image flow |
+| `sample_images/stop.png` | Included input for testing the image flow |
 | `requirements.txt` | Hosted Streamlit dependencies |
 | `requirements_pc.txt` | Local dashboard dependencies |
 | `requirements_rpi.txt` | Pi streamer dependencies |
@@ -52,6 +52,6 @@ Check `http://<pi-address>:5000/health` and `http://<pi-address>:5000/` from the
 
 ## Testing and presentation
 
-The included illustration confirms that the interface can accept an image and run the inference path, but it may yield no detections. For a portfolio screenshot, run the model on a real photo you have permission to use, verify the label and bounding box, then capture the actual output. Add that screenshot under `docs/` and link it here. No accuracy, latency, or FPS measurements are asserted without a recorded evaluation or hardware test. The Raspberry Pi camera and Bluetooth output require testing on the physical device.
+The included image lets visitors run the inference path, but it may yield no detections. For a portfolio screenshot, run the model on a real photo you have permission to use, verify the label and bounding box, then capture the actual output. Add that screenshot under `docs/` and link it here. No accuracy, latency, or FPS measurements are asserted without a recorded evaluation or hardware test. The Raspberry Pi camera and Bluetooth output require testing on the physical device.
 
 The model file is about 88 MB. GitHub may warn on files larger than 50 MiB; its normal hard limit is 100 MiB. Keep the weights in the repo only if the model's dataset and training terms permit redistribution.

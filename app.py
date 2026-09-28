@@ -62,7 +62,7 @@ st.set_page_config(
 )
 
 MODEL_PATH = Path(__file__).parent / "best.pt"
-SAMPLE_PATH = Path(__file__).parent / "sample_images" / "illustrative_stop.png"
+SAMPLE_PATH = Path(__file__).parent / "sample_images" / "stop.png"
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
@@ -917,8 +917,8 @@ def render_image_demo(model, cfg: dict):
     if source == "Included sample":
         if SAMPLE_PATH.exists():
             raw = SAMPLE_PATH.read_bytes()
-            st.image(raw, caption="Illustrative test image (drawn for this demo; "
-                     "it is not a measured detection result)", width=520)
+            st.image(raw, caption="Included test image ("
+                     "results depend on the model)", width=520)
         else:
             st.info("No included image is available. Choose Upload image instead.")
     elif source == "Upload image":
